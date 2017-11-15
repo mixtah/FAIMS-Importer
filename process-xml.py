@@ -10,6 +10,7 @@
 
 import sys
 import os
+import json,xml
 
 from argparse import ArgumentParser
 from argparse import RawDescriptionHelpFormatter
@@ -17,6 +18,8 @@ from argparse import RawDescriptionHelpFormatter
 DEBUG = 1
 TESTRUN = 0
 PROFILE = 0
+
+DEFAULT_CHUNK_SIZE = 5000
 
 program_name = "FAIMS to Alveo Converter"
 
@@ -30,9 +33,31 @@ class CLIError(Exception):
     def __unicode__(self):
         return self.msg
 
+def get_files(srcdir, item_pattern=''):
+    ''' This function generates a sequence of files that
+    the Austalk ingest should actually process
+    Note this is a generator (using yield)'''
+
+    res = []
+    src_depth = len(srcdir.split(os.path.sep))
+    for root, dirnames, filenames in os.walk(srcdir):
+        for filename in filenames:
+            if re.match(item_pattern, filename):
+                res.append(os.path.join(root, filename))
+
+                if len(res)>=DEFAULT_CHUNK_SIZE:
+                    yield res
+                    res = []
+
+    if len(res)>0:
+        yield res
 
 def process_data(input=None,output=None,verbose=False):
     #Do stuff here
+    item_pattern = ".*\.xml"
+    json_data = {}
+    
+    
     
     return 0
 
