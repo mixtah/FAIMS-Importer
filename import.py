@@ -52,10 +52,34 @@ def read_csv(input_dir):
     return res
 
 def process_data(input_dir=None,apiKey=None,collection=None, verbose=False,
-                 skip_downsampled=False, include_backup=False):
+                 skip_downsampled=False, include_backup=False, dont_keep_one=False):
+    
+    
+    def add_document(relpath,fname,displaydoc=False,skip_downsampled=skip_downsampled):
+        start_doc_time = time.time()
+        path = os.path.join(input_dir,relpath)
+        spl = os.path.basename(path).split('.')
+        docid = None
+        if skip_downsampled:
+            name = spl[0]+"_"+fname+"."+spl[1]
+            docid = client.add_document(item_uri, name, {"@id":name}, file=path, fileNameIsName=True)
+        else:
+            start_down_time = time.time()
+            print("Starting Audio Downsample...")
+            name = spl[0]+'_'+fname+"_downsampled."+DOWNSAMPLED_FORMAT
+            if downsampleAudio(path, resultName=name, verbose=verbose):
+                print("Finished Audio Downsample... "+str(int(time.time()-start_down_time))+"s")
+                downsampledPath = path[:path.rfind(os.sep)]+os.sep+name
+                docid = client.add_document(item_uri, name, {"@id":name}, file=downsampledPath,displaydoc=displaydoc, fileNameIsName=True)
+            else:
+                print("Failed to Downsample the Audio File... "+str(int(time.time()-start_down_time))+"s")
+                return None
+        print("Added "+fname+" File: "+docid+"  Processing Time: "+str(int(time.time()-start_doc_time))+"s")
+        return docid
     
     client = pyalveo.Client(api_url=BASE_URL,api_key=apiKey,verifySSL=False)
     
+    client.add_context("faims", "http://fedarch.org/schema/")
     # TODO: check to see if we're able to modify the given collection (and that it exists)
     
     collection_uri = BASE_URL+'catalog/'+collection
@@ -67,18 +91,46 @@ def process_data(input_dir=None,apiKey=None,collection=None, verbose=False,
     
     for speaker in speaker_data:
         try:
+            start_time = time.time()
             if DELETE:
-                r = client.delete_speaker("https://staging.alveo.edu.au/speakers/faims-test/"+speaker['uuid'])
+                r = client.delete_speaker("https://staging.alveo.edu.au/speakers/faims-test/"+speaker.get('uuid',''))
                 print("Deleting Speaker - Result: "+str(r))
             if verbose:
                 print("Handling Speaker: "+speaker.get('identifier','None'));
-            speaker['dcterms:identifier'] = speaker['uuid']
+            
+            #Add faims context in front of each element
+            speaker_meta = {'faims:%s'% name[0].lower() + name[1:]:val for name,val in speaker.iteritems()}
+            
+            speaker_meta['dcterms:identifier'] = speaker_meta.get('faims:uuid','')
+            speaker_meta['dcterms:created'] = speaker_meta.get('faims:createdAtGMT',None)[:10]
+            
+            speaker_meta['foaf:name'] = speaker_meta.get('faims:firstNameOfInterviewee','') + ' ' + speaker_meta.get('faims:lastNameOfInterviewee','')
+            speaker_meta['foaf:gender'] = speaker_meta.get('faims:gender',None)
+            speaker_meta['austalk:father_pob_town'] = speaker_meta.get('faims:whereWasYourFatherBornVillage','')
+            speaker_meta['austalk:father_pob_state'] = speaker_meta.get('faims:whereWasYourFatherBornRegion','')
+            
+            speaker_meta.pop("faims:timeWhenInterviewEnded",None)
+            speaker_meta.pop("faims:zoomH2nFiles",None)
+            speaker_meta.pop("faims:zoomH6ExternalMic",None)
+            speaker_meta.pop("faims:zoomH6PrimaryMic",None)
+            speaker_meta.pop("faims:photoOfSignedConsentForm",None)
+            
+            #Remove metadata fields that have no data
+            rem = []
+            
+            for i in speaker_meta:
+                if not speaker_meta[i]:
+                    rem.append(i)
+            
+            for i in rem:
+                speaker_meta.pop(i,None)
+            
+            speaker_uri = BASE_URL+"speakers/"+collection+"/"+speaker['uuid']
             try:
-                speaker_uri = client.add_speaker(collection, speaker)
+                speaker_uri = client.add_speaker(collection, speaker_meta)
                 print("Added Speaker: "+speaker_uri)
             except pyalveo.APIError, e:
                 if e.http_status_code==412:
-                    speaker_uri = BASE_URL+"speakers/"+collection+"/"+speaker['uuid']
                     print("Skipping Add Speaker"+speaker.get('identifier','None')+": Speaker already exists. URI: "+speaker_uri)
                     continue
             #seems like each speaker only has one item. 
@@ -89,13 +141,19 @@ def process_data(input_dir=None,apiKey=None,collection=None, verbose=False,
                 item_metadata = json.load(item_metadata_file)
                 
             if DELETE: #Get rid of 'and False' when we are able to delete
-                r = client.delete_item("https://staging.alveo.edu.au/catalog/austalk/"+item_metadata['ImageID'])
-                print("Deleting Item - Result: "+str(r))
+                try:
+                    r = client.delete_item("https://staging.alveo.edu.au/catalog/faims-test/"+item_metadata['ImageID'])
+                    print("Deleting Item - Result: "+str(r))
+                except pyalveo.APIError, e:
+                    if e.http_status_code==404:
+                        pass
             
             item_metadata.pop("SourceFile",None)
             item_metadata['dcterms:title'] = item_metadata.pop('ImageDescription','')
             item_metadata['dcterms:creator'] = item_metadata.pop('XPAuthor','')
             item_metadata['dcterms:created'] = item_metadata['Keywords'][0] #Should be date in 1st position
+            item_metadata['olac:speaker'] = speaker_uri
+            item_metadata['dcterms:created'] = speaker.get('createdAtGMT',None)[:10]
             
             try:
                 item_uri = client.add_item(collection_uri, item_metadata['ImageID'], item_metadata)
@@ -107,49 +165,26 @@ def process_data(input_dir=None,apiKey=None,collection=None, verbose=False,
                     continue
             
             #Get photo of concent form 'PhotoOfSignedConsentForm'
-            consentFormPath = os.path.join(input_dir,speaker['PhotoOfSignedConsentForm'])
-            name = consentFormPath.split(os.sep)[-1].split('.')[0]
-            consentFormId = client.add_document(item_uri, name, {}, file=consentFormPath)
-            print("Added Photo Of Signed Consent Form: "+consentFormId)
+            add_document(speaker['PhotoOfSignedConsentForm'], "consentform", skip_downsampled=True)
             
             #Get H2n Audio file  'ZoomH2nFiles' (only one linked)
-            H2NPath = os.path.join(input_dir,speaker['ZoomH2nFiles'])
-            name = H2NPath.split(os.sep)[-1].split('.')[0]
-            H2NId = client.add_document(item_uri, name, {}, file=H2NPath)
-            print("Added H2N Audio File: "+H2NId)
+            add_document(speaker['ZoomH2nFiles'], "h2n")
             
             #Get H6Primay Audio File 'ZoomH6PrimaryMic'
-            H6PrimayPath = os.path.join(input_dir,speaker['ZoomH6PrimaryMic'])
-            name = H6PrimayPath.split(os.sep)[-1].split('.')[0]
-            H6PrimayId = client.add_document(item_uri, name, {}, file=H6PrimayPath)
-            print("Added H6 Primary Audio File: "+H6PrimayId)
+            add_document(speaker['ZoomH6PrimaryMic'], "h6primary")
             
             #Get H6External Audio File 'ZoomH6ExternalMic'
-            H6ExternalPath = os.path.join(input_dir,speaker['ZoomH6ExternalMic'])
-            name = H6ExternalPath.split(os.sep)[-1].split('.')[0]
-            H6ExternalId = client.add_document(item_uri, name, {}, file=H6ExternalPath)
-            print("Added H6 External Audio File: "+H6ExternalId)
+            add_document(speaker['ZoomH6ExternalMic'], "h6external",displaydoc=True)
+            
+            #Get H6External Audio File and upload without downsampling
+            if not dont_keep_one and not skip_downsampled:
+                add_document(speaker['ZoomH6ExternalMic'], "h6external_original",skip_downsampled=True)
             
             #Get Backup Recordings 'BackupRecordings' (optional default:false)
             if include_backup:
-                BackupPath = os.path.join(input_dir,speaker['PhotoOfSignedConsentForm'])
-                name = BackupPath.split(os.sep)[-1].split('.')[0]
-                BackupId = client.add_document(item_uri, name, {}, file=BackupPath)
-                print("Added Document: "+BackupId)
+                add_document(speaker['BackupRecordings'], "backup")
             
-            #Downsample the H6External file and upload that
-            # - then delete the local downsampled version
-            start_time = time.time()
-            print("Starting Audio Downsample...")
-            if downsampleAudio(H6ExternalPath, verbose=verbose):
-                print("Finished Audio Downsample... "+str(int(time.time()-start_time))+"s")
-                downsampledPath = os.path.join(input_dir,speaker['ZoomH6ExternalMic'])
-                downsampledPath = downsampledPath[:downsampledPath.rfind(os.sep)]+os.sep+"downsampled."+DOWNSAMPLED_FORMAT
-                name = H6ExternalPath.split(os.sep)[-1].split('.')[0]+"_downsampled"
-                downsampledId = client.add_document(item_uri, name, {}, file=downsampledPath)
-                print("Added Document: "+downsampledId)
-            else:
-                print("Failed to Downsample the Audio File... "+str(int(time.time()-start_time))+"s")
+            print("Finished Handling Speaker: "+speaker.get('identifier','None')+"  Processing Time: "+str(int(time.time()-start_time))+"s");
             
         except pyalveo.APIError, e:
             if e.http_status_code==403:
@@ -165,8 +200,7 @@ def process_data(input_dir=None,apiKey=None,collection=None, verbose=False,
     print("All Data has successfully been added to Alveo.")
     return 0
 
-
-def downsampleAudio(file,verbose=False,samplerate=DOWNSAMPLED_SAMPLERATE,bitrate=DOWNSAMPLED_BITRATE,dstFormat=DOWNSAMPLED_FORMAT):
+def downsampleAudio(file,resultName="downsampled."+DOWNSAMPLED_FORMAT, verbose=False,samplerate=DOWNSAMPLED_SAMPLERATE,bitrate=DOWNSAMPLED_BITRATE,dstFormat=DOWNSAMPLED_FORMAT):
     ''' Will convent an audio file to mp3 and downsample it to 16bit. File must be the full directory. '''
     stdout = stderr = None
     if verbose:
@@ -174,7 +208,7 @@ def downsampleAudio(file,verbose=False,samplerate=DOWNSAMPLED_SAMPLERATE,bitrate
         
     dir = file[:file.rfind(os.sep)]
     #convert file type
-    process = subprocess.Popen('ffmpeg -i '+file+' -ar '+samplerate+' -b:a '+bitrate+' '+dir+os.sep+'downsampled.'+dstFormat,stdout=stdout,stderr=stderr)
+    process = subprocess.Popen('ffmpeg -i '+file+' -y '+' -ar '+samplerate+' -b:a '+bitrate+' '+dir+os.sep+resultName,stdout=stdout,stderr=stderr)
     
     poll = None
     while poll==None:
@@ -204,8 +238,9 @@ def main(argv=None): # IGNORE:C0111
         parser.add_argument("-i", "--input", dest="input", help="The Root file to be Imported", metavar="path" )
         parser.add_argument("-k", "--apikey", dest="apikey", help="The API Key as Generated by Alveo. See https://app.alveo.edu.au/")
         parser.add_argument("-c", "--collection", dest="collection", help="The collection this data will be added to. You must be a data_owner in order to add documents to a collection.", metavar="path" )
-        parser.add_argument("-d", "--skip-downsampled", dest="skipdownsampled", action="count", help="Skip generated a downsampled version of the main audio file. This lower quality version allows researchers to sample the audio online without having to download the full sized file.\nUse This option if you don't have FFMPEG installed or setup properly." )
+        parser.add_argument("-d", "--skip-downsampled", dest="skipdownsampled", action="count", help="Skip generated a downsampled version of the audio files. This lower quality version allows researchers to sample the audio online without having to download the full sized file.\nUse This option if you don't have FFMPEG installed or setup properly." )
         parser.add_argument("-b", "--include-backup", dest="includebackup", action="count", help="Will include the backup audio files (if exists) when uploading items to Alveo." )
+        parser.add_argument("-o", "--no-archive-file", dest="dontkeepone", action="count", help="Use if you don't want to upload one of the original files for archival purposes.\nHas no effect if --skip-downsampled is used." )  
         #Skip Backup file (default true)
         
 
@@ -214,17 +249,20 @@ def main(argv=None): # IGNORE:C0111
         skip_downsampled = True if args.skipdownsampled else False
         include_backup = True if args.includebackup else False
         verbose = True if args.verbose else False
+        dont_keep_one = True if args.dontkeepone else False
         
         return process_data(input_dir=args.input, 
                             apiKey=args.apikey, 
                             collection=args.collection, 
                             skip_downsampled = skip_downsampled,
                             include_backup = include_backup,
+                            dont_keep_one = dont_keep_one, 
                             verbose=verbose)
     
     except KeyboardInterrupt:
         ### handle keyboard interrupt ###
         return 0
+    #Uncomment for release version (so errors not displayed directly to users)
     #except Exception, e:
     #    if DEBUG or TESTRUN:
     #        raise(e)
